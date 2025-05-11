@@ -65,21 +65,4 @@ Le flag --windowed évite l’ouverture d’une console
 3. Lancer le jeu
 Va dans dist/ et double-clique sur chess_game.exe
 
-📁 Arborescence du projet
-Copier
-Modifier
-Chess/
-├── chess_game.py
-├── README.md
-├── build/
-├── dist/
-│   └── chess_game.exe
-└── chess_game.spec
-🚧 À venir
-Détection d’échec et mat
 
-IA basique (joueur contre ordinateur)
-
-Sauvegarde/reprise de partie
-
-Affichage du dernier coup
