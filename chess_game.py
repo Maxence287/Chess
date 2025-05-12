@@ -7,6 +7,12 @@ import logging
 import datetime
 import random
 import os
+import json
+import chess.polyglot
+import socket
+import threading
+import pickle
+from pyngrok import ngrok
 
 # --- CONFIG ---
 SQUARE_SIZE = 80
@@ -20,8 +26,9 @@ PIECES_UNICODE = {
     "P": "♙", "p": "♟", "R": "♖", "r": "♜", "N": "♘", "n": "♞",
     "B": "♗", "b": "♝", "Q": "♕", "q": "♛", "K": "♔", "k": "♚"
 }
-ANIMATION_SPEED = 20  # Reduced from 30 to 20 ms for faster animation
-ANIMATION_STEPS = 10  # Kept at 10 steps (total animation time: 200 ms)
+ANIMATION_SPEED = 10
+ANIMATION_STEPS = 5
+SOCKET_TIMEOUT = 10  # Timeout for socket operations in seconds
 
 # --- LOGGING ---
 logging.basicConfig(filename='logs.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -44,7 +51,7 @@ PIECE_SQUARE_TABLES = {
                  -10, -20, -20, -20, -20, -20, -20, -10, 20, 20, 10, 0, 0, 10, 20, 20, 20, 20, 10, 0, 0, 10, 20, 20]
 }
 
-def evaluate(board):
+def evaluate(board, learning_data=None):
     try:
         if board.is_checkmate():
             return -99999 if board.turn == chess.WHITE else 99999
@@ -58,24 +65,27 @@ def evaluate(board):
                 value = PIECE_VALUES[piece.piece_type]
                 psqt = PIECE_SQUARE_TABLES[piece.piece_type]
                 idx = square if piece.color == chess.WHITE else 63 - square
-                score += (value + psqt[idx]) if piece.color == chess.WHITE else -(value + psqt[idx])
+                weight = learning_data["weights"].get("pawn" if piece.piece_type == chess.PAWN else "king" if piece.piece_type == chess.KING else "mobility", 1.0) if learning_data else 1.0
+                score += (value + psqt[idx]) * weight if piece.color == chess.WHITE else -(value + psqt[idx]) * weight
+
+        mobility = len(list(board.legal_moves)) * 5 * (learning_data["weights"].get("mobility", 1.0) if learning_data else 1.0)
+        score += mobility if board.turn == chess.WHITE else -mobility
 
         return score
     except Exception as e:
         logging.error(f"Evaluation failed: {e}")
         return 0
 
-def alpha_beta(board, depth, alpha, beta, maximizing):
+def alpha_beta(board, depth, alpha, beta, maximizing, learning_data=None):
     try:
         if depth == 0 or board.is_game_over():
-            score = evaluate(board)
-            return score, None
+            return evaluate(board, learning_data), None
 
         best_move = None
         moves = list(board.legal_moves)
         for move in moves:
             board.push(move)
-            eval_score, _ = alpha_beta(board, depth - 1, alpha, beta, not maximizing)
+            eval_score, _ = alpha_beta(board, depth - 1, alpha, beta, not maximizing, learning_data)
             board.pop()
             if maximizing:
                 if eval_score > alpha:
@@ -94,14 +104,20 @@ def alpha_beta(board, depth, alpha, beta, maximizing):
         logging.error(f"Alpha-beta search failed: {e}")
         return 0, None
 
-def get_bot_move(board, difficulty):
+def get_bot_move(board, difficulty, learning_data=None):
     try:
-        depth = {1: 2, 2: 3, 3: 4, 4: 5, 5: 6}[difficulty]
-        _, move = alpha_beta(board, depth, -float('inf'), float('inf'), board.turn == chess.WHITE)
+        experience = learning_data["games"] if learning_data and learning_data["games"] > 0 else 0
+        depth = min(6, max(2, 2 + experience // 10))
+        if experience < 20 and os.path.exists("polyglot.bin"):
+            with chess.polyglot.open_reader("polyglot.bin") as reader:
+                entries = list(reader.find_all(board))
+                if entries:
+                    return max(entries, key=lambda e: e.weight).move
+        _, move = alpha_beta(board, depth, -float('inf'), float('inf'), board.turn == chess.WHITE, learning_data)
         return move
     except Exception as e:
         logging.error(f"Bot move generation failed: {e}")
-        return None
+        return random.choice(list(board.legal_moves)) if board.legal_moves else None
 
 # --- PUZZLES (Static Example) ---
 PUZZLES = [
@@ -123,20 +139,33 @@ class ChessApp:
             self.current_theme = "Chess.com"
             self.timer = {"white": 600, "black": 600}
             self.timer_running = False
+            self.timer_id = None  # To track timer after calls
             self.difficulty = 3
             self.game = chess.pgn.Game()
             self.board_flipped = False
             self.evaluations = []
             self.puzzle_mode = False
             self.current_puzzle = None
-            self.best_moves = []  # To store best moves for each position
-            self.player_moves = []  # To store player's moves for analysis
-            self.animations_enabled = True  # Animation toggle
+            self.best_moves = []
+            self.player_moves = []
+            self.animations_enabled = True
+            self.learning_data = {"weights": {"pawn": 1.0, "king": 1.0, "mobility": 1.0}, "games": 0, "performance": 0.5, "elo": 1500}
+            self.multiplayer_mode = False
+            self.is_host = False
+            self.player_color = chess.WHITE
+            self.server_socket = None
+            self.client_socket = None
+            self.opponent_socket = None
+            self.server_thread = None
+            self.listen_thread = None
+            self.game_port = None
+            self.ngrok_url = None
+            self.thread_lock = threading.Lock()  # For thread safety
 
             self.main_frame = tk.Frame(root, bg=THEMES[self.current_theme]["bg"], padx=10, pady=10)
             self.main_frame.pack(fill="both", expand=True)
 
-            self.canvas = tk.Canvas(self.main_frame, width=BOARD_SIZE+40, height=BOARD_SIZE+40, bg=THEMES[self.current_theme]["border"], highlightthickness=0)
+            self.canvas = tk.Canvas(self.main_frame, width=BOARD_SIZE+40, height=BOARD_SIZE+40, bg=THEMES[self.current_theme]["border"], highlightthickness=2, highlightbackground=THEMES[self.current_theme]["text"])
             self.canvas.pack(side="left", padx=10, pady=10)
             self.canvas.bind("<Button-1>", self.on_click)
 
@@ -168,6 +197,8 @@ class ChessApp:
 
             controls = [
                 ("New Game", self.new_game, "Start a new game"),
+                ("Host Multiplayer", self.host_multiplayer, "Host a multiplayer game"),
+                ("Join Multiplayer", self.join_multiplayer, "Join a multiplayer game"),
                 ("Undo Move", self.undo_move, "Undo the last move"),
                 ("Get Hint", self.get_hint, "Get a suggested move"),
                 ("Resign", self.resign, "Resign the game"),
@@ -192,6 +223,7 @@ class ChessApp:
             ttk.Combobox(self.sidebar, textvariable=self.difficulty_var, values=["1", "2", "3", "4", "5"], state="readonly", width=18, font=("Arial", 9)).pack(pady=5)
             self.difficulty_var.trace("w", self.change_difficulty)
 
+            self.load_learning_data()
             logging.info("--- New Game Started ---")
             self.draw_board()
             self.update_pieces()
@@ -200,10 +232,222 @@ class ChessApp:
             logging.error(f"Initialization failed: {e}")
             messagebox.showerror("Error", f"Initialization failed: {e}")
 
+    def host_multiplayer(self):
+        try:
+            if self.multiplayer_mode:
+                messagebox.showwarning("Warning", "Already in a multiplayer game!")
+                return
+
+            self.cleanup_multiplayer()  # Ensure previous connections are closed
+            self.multiplayer_mode = True
+            self.is_host = True
+            self.player_color = chess.WHITE
+            self.board_flipped = False
+            self.new_game()
+
+            # Generate a random port and start server
+            self.game_port = 5000 + random.randint(0, 1000)
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.settimeout(SOCKET_TIMEOUT)
+            self.server_socket.bind(('0.0.0.0', self.game_port))
+            self.server_socket.listen(1)
+
+            # Optional ngrok for public access
+            use_ngrok = messagebox.askyesno("ngrok", "Use ngrok for public link? (Requires internet)")
+            if use_ngrok:
+                try:
+                    public_url = ngrok.connect(self.game_port, "tcp")
+                    self.ngrok_url = public_url.public_url
+                    link = self.ngrok_url.replace("tcp://", "http://")
+                except Exception as e:
+                    logging.error(f"ngrok failed: {e}")
+                    messagebox.showerror("Error", "Failed to create ngrok link. Using local IP instead.")
+                    host_ip = socket.gethostbyname(socket.gethostname())
+                    link = f"http://{host_ip}:{self.game_port}"
+            else:
+                host_ip = socket.gethostbyname(socket.gethostname())
+                link = f"http://{host_ip}:{self.game_port}"
+
+            messagebox.showinfo("Hosting", f"Share this link with your opponent:\n{link}")
+            self.server_thread = threading.Thread(target=self.accept_connection)
+            self.server_thread.daemon = True
+            self.server_thread.start()
+            logging.info(f"Hosting game on {link}")
+
+        except Exception as e:
+            logging.error(f"Host multiplayer failed: {e}")
+            messagebox.showerror("Error", f"Host multiplayer failed: {e}")
+            self.cleanup_multiplayer()
+
+    def accept_connection(self):
+        try:
+            self.opponent_socket, addr = self.server_socket.accept()
+            self.opponent_socket.settimeout(SOCKET_TIMEOUT)
+            logging.info(f"Opponent connected from {addr}")
+            self.root.after(0, lambda: self.status_label.config(text="Opponent connected! Your turn as White."))
+            self.listen_thread = threading.Thread(target=self.listen_for_moves)
+            self.listen_thread.daemon = True
+            self.listen_thread.start()
+        except socket.timeout:
+            logging.error("Accept connection timed out")
+            self.root.after(0, lambda: messagebox.showerror("Error", "Connection timed out while waiting for opponent"))
+            self.root.after(0, self.cleanup_multiplayer)
+        except Exception as e:
+            logging.error(f"Accept connection failed: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Accept connection failed: {e}"))
+            self.root.after(0, self.cleanup_multiplayer)
+
+    def join_multiplayer(self):
+        try:
+            if self.multiplayer_mode:
+                messagebox.showwarning("Warning", "Already in a multiplayer game!")
+                return
+
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Join Multiplayer Game")
+            dialog.geometry("300x150")
+            dialog.config(bg=THEMES[self.current_theme]["bg"])
+
+            tk.Label(dialog, text="Enter Game Link:", bg=THEMES[self.current_theme]["bg"], fg=THEMES[self.current_theme]["text"]).pack(pady=5)
+            link_entry = tk.Entry(dialog, width=40)
+            link_entry.pack(pady=5)
+            link_entry.insert(0, "http://localhost:5000")  # Default for testing
+
+            def join_game():
+                link = link_entry.get().strip()
+                if not link:
+                    messagebox.showerror("Error", "Link cannot be empty!")
+                    return
+                try:
+                    import re
+                    match = re.search(r'http://([\w\.-]+):(\d+)', link)
+                    if not match:
+                        messagebox.showerror("Error", "Invalid link format! Expected http://<host>:<port>")
+                        return
+                    host, port = match.groups()
+                    port = int(port)
+                    self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.client_socket.settimeout(SOCKET_TIMEOUT)
+                    self.client_socket.connect((host, port))
+                    self.multiplayer_mode = True
+                    self.is_host = False
+                    self.player_color = chess.BLACK
+                    self.board_flipped = True
+                    self.new_game()
+                    dialog.destroy()
+                    self.status_label.config(text="Connected! Waiting for White's move.")
+                    self.listen_thread = threading.Thread(target=self.listen_for_moves)
+                    self.listen_thread.daemon = True
+                    self.listen_thread.start()
+                except socket.timeout:
+                    logging.error("Connection timed out")
+                    messagebox.showerror("Error", "Connection timed out while joining game")
+                    self.cleanup_multiplayer()
+                except Exception as e:
+                    logging.error(f"Join game failed: {e}")
+                    messagebox.showerror("Error", f"Join game failed: {e}")
+                    self.cleanup_multiplayer()
+
+            tk.Button(dialog, text="Join Game", command=join_game, bg=THEMES[self.current_theme]["button"], fg="#FFFFFF").pack(pady=10)
+        except Exception as e:
+            logging.error(f"Join multiplayer failed: {e}")
+            messagebox.showerror("Error", f"Join multiplayer failed: {e}")
+
+    def listen_for_moves(self):
+        try:
+            while self.multiplayer_mode:
+                with self.thread_lock:
+                    socket_to_use = self.opponent_socket if self.is_host else self.client_socket
+                    if socket_to_use is None:
+                        break
+                data = socket_to_use.recv(1024)
+                if not data:
+                    self.root.after(0, lambda: messagebox.showinfo("Disconnected", "Opponent disconnected!"))
+                    self.root.after(0, self.cleanup_multiplayer)
+                    break
+                try:
+                    move = pickle.loads(data)
+                    if not isinstance(move, chess.Move) or not self.board.is_legal(move):
+                        logging.error("Invalid move received")
+                        continue
+                    self.root.after(0, lambda: self.receive_move(move))
+                except pickle.PickleError as e:
+                    logging.error(f"Invalid data received: {e}")
+                    self.root.after(0, lambda: messagebox.showerror("Error", "Invalid move data received"))
+        except socket.timeout:
+            logging.error("Listen for moves timed out")
+            self.root.after(0, lambda: messagebox.showerror("Error", "Connection timed out"))
+            self.root.after(0, self.cleanup_multiplayer)
+        except Exception as e:
+            logging.error(f"Listen for moves failed: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Listen for moves failed: {e}"))
+            self.root.after(0, self.cleanup_multiplayer)
+
+    def receive_move(self, move):
+        try:
+            captured_piece = self.board.piece_at(move.to_square)
+            if captured_piece:
+                self.captured_pieces[self.board.turn].append(captured_piece.piece_type)
+            self.animate_move(move.from_square, move.to_square)
+            san = self.board.san(move)
+            self.board.push(move)
+            self.move_history.append(move)
+            self.update_pieces()
+            logging.info(f"Received move: {san}")
+            self.status_label.config(text="Your turn!" if self.board.turn == self.player_color else "Waiting for opponent's move...")
+            if self.board.is_game_over():
+                self.status_label.config(text=f"Game Over: {self.board.result()}")
+        except Exception as e:
+            logging.error(f"Receive move failed: {e}")
+            messagebox.showerror("Error", f"Receive move failed: {e}")
+
+    def send_move(self, move):
+        try:
+            socket_to_use = self.opponent_socket if self.is_host else self.client_socket
+            if socket_to_use:
+                socket_to_use.send(pickle.dumps(move))
+                logging.info(f"Sent move: {move.uci()}")
+                self.status_label.config(text="Waiting for opponent's move...")
+        except socket.timeout:
+            logging.error("Send move timed out")
+            messagebox.showerror("Error", "Connection timed out while sending move")
+            self.cleanup_multiplayer()
+        except Exception as e:
+            logging.error(f"Send move failed: {e}")
+            messagebox.showerror("Error", f"Send move failed: {e}")
+            self.cleanup_multiplayer()
+
+    def cleanup_multiplayer(self):
+        try:
+            with self.thread_lock:
+                self.multiplayer_mode = False
+                self.is_host = False
+                self.player_color = chess.WHITE
+                if self.server_socket:
+                    self.server_socket.close()
+                    self.server_socket = None
+                if self.client_socket:
+                    self.client_socket.close()
+                    self.client_socket = None
+                if self.opponent_socket:
+                    self.opponent_socket.close()
+                    self.opponent_socket = None
+                if self.ngrok_url:
+                    try:
+                        ngrok.disconnect(self.ngrok_url)
+                    except:
+                        pass
+                    self.ngrok_url = None
+                self.server_thread = None
+                self.listen_thread = None
+            self.new_game()
+        except Exception as e:
+            logging.error(f"Cleanup multiplayer failed: {e}")
+
     def draw_board(self):
         try:
             self.canvas.delete("all")
-            self.canvas.create_rectangle(0, 0, BOARD_SIZE+40, BOARD_SIZE+40, fill=THEMES[self.current_theme]["border"])
+            self.canvas.create_rectangle(0, 0, BOARD_SIZE+40, BOARD_SIZE+40, fill=THEMES[self.current_theme]["border"], outline=THEMES[self.current_theme]["text"], width=2)
             for row in range(8):
                 for col in range(8):
                     board_row = 7 - row if not self.board_flipped else row
@@ -319,8 +563,12 @@ class ChessApp:
 
     def update_evaluation(self):
         try:
-            score = evaluate(self.board) / 100.0
-            self.eval_label.config(text=f"Evaluation: {score:+.1f}")
+            score = evaluate(self.board, self.learning_data)
+            if score is not None:
+                score = score / 100.0
+                self.eval_label.config(text=f"Evaluation: {score:+.1f}")
+            else:
+                self.eval_label.config(text="Evaluation: N/A")
         except Exception as e:
             logging.error(f"Evaluation update failed: {e}")
             self.eval_label.config(text="Evaluation: N/A")
@@ -329,11 +577,17 @@ class ChessApp:
         try:
             if self.board.is_game_over():
                 self.status_label.config(text=f"Game Over: {self.board.result()}", fg="#4CAF50")
-                self.analyze_game_end()  # Analyze game at the end
+                self.analyze_game_end()
             else:
                 turn = "White" if self.board.turn == chess.WHITE else "Black"
                 state = " (Check)" if self.board.is_check() else ""
-                self.status_label.config(text=f"{turn}'s turn{state}", fg="#D32F2F" if self.board.is_check() else THEMES[self.current_theme]["text"])
+                if self.multiplayer_mode:
+                    if self.board.turn == self.player_color:
+                        self.status_label.config(text=f"Your turn ({turn}){state}", fg="#D32F2F" if self.board.is_check() else THEMES[self.current_theme]["text"])
+                    else:
+                        self.status_label.config(text=f"Waiting for opponent's move ({turn}){state}", fg="#D32F2F" if self.board.is_check() else THEMES[self.current_theme]["text"])
+                else:
+                    self.status_label.config(text=f"{turn}'s turn{state}", fg="#D32F2F" if self.board.is_check() else THEMES[self.current_theme]["text"])
         except Exception as e:
             logging.error(f"Update status failed: {e}")
             messagebox.showerror("Error", f"Update status failed: {e}")
@@ -355,16 +609,27 @@ class ChessApp:
                     messagebox.showinfo("Time Out", f"{winner} wins on time!")
                     self.new_game()
                     logging.info(f"Game ended: {winner} wins on time")
-                self.root.after(100, self.update_timer)
+                else:
+                    self.timer_id = self.root.after(100, self.update_timer)
         except Exception as e:
             logging.error(f"Update timer failed: {e}")
             messagebox.showerror("Error", f"Update timer failed: {e}")
+
+    def stop_timer(self):
+        if self.timer_id:
+            self.root.after_cancel(self.timer_id)
+            self.timer_id = None
+        self.timer_running = False
 
     def on_click(self, event):
         try:
             if self.board.is_game_over() or self.puzzle_mode:
                 messagebox.showinfo("Info", "Game Over or Puzzle Mode active" if self.board.is_game_over() else "Solve the puzzle first")
                 logging.info(f"Click ignored: Game Over or Puzzle Mode")
+                return
+
+            if self.multiplayer_mode and self.board.turn != self.player_color:
+                messagebox.showinfo("Info", "It's not your turn!")
                 return
 
             col = (event.x - 20) // SQUARE_SIZE
@@ -437,19 +702,19 @@ class ChessApp:
 
     def handle_move(self, move):
         try:
-            # Calculate best move before pushing the player's move
-            best_score, best_move = alpha_beta(self.board, self.difficulty + 1, -float('inf'), float('inf'), self.board.turn == chess.WHITE)
-            self.best_moves.append((best_move, best_score))
-            self.player_moves.append(move)
+            if not self.multiplayer_mode:
+                best_score, best_move = alpha_beta(self.board, self.difficulty + 1, -float('inf'), float('inf'), self.board.turn == chess.WHITE, self.learning_data)
+                self.best_moves.append((best_move, best_score))
+                self.player_moves.append(move)
 
-            before_eval = evaluate(self.board)
+            before_eval = evaluate(self.board, self.learning_data)
             captured_piece = self.board.piece_at(move.to_square)
             if captured_piece:
                 self.captured_pieces[self.board.turn].append(captured_piece.piece_type)
             self.animate_move(move.from_square, move.to_square)
             san = self.board.san(move)
             self.board.push(move)
-            after_eval = evaluate(self.board)
+            after_eval = evaluate(self.board, self.learning_data)
             self.evaluations.append(before_eval - after_eval if self.board.turn == chess.BLACK else after_eval - before_eval)
             self.move_history.append(move)
             player = "Human" if self.board.turn == chess.BLACK else "AI"
@@ -459,21 +724,24 @@ class ChessApp:
             self.selected_square = None
             self.possible_moves = []
 
-            self.timer_running = True
-            if self.board.is_game_over():
-                messagebox.showinfo("Game Over", f"Result: {self.board.result()}")
-                logging.info(f"Game Over: {self.board.result()}")
-            elif self.puzzle_mode and san != self.current_puzzle["solution"]:
-                messagebox.showinfo("Puzzle", "Wrong move! Try again.")
-                self.board.pop()
-                self.move_history.pop()
-                self.evaluations.pop()
-                self.best_moves.pop()
-                self.player_moves.pop()
-                self.captured_pieces[self.board.turn].pop() if captured_piece else None
-                self.update_pieces()
+            if self.multiplayer_mode:
+                self.send_move(move)
             else:
-                self.root.after(500, self.play_bot)
+                self.timer_running = True
+                if self.board.is_game_over():
+                    messagebox.showinfo("Game Over", f"Result: {self.board.result()}")
+                    logging.info(f"Game Over: {self.board.result()}")
+                elif self.puzzle_mode and san != self.current_puzzle["solution"]:
+                    messagebox.showinfo("Puzzle", "Wrong move! Try again.")
+                    self.board.pop()
+                    self.move_history.pop()
+                    self.evaluations.pop()
+                    self.best_moves.pop()
+                    self.player_moves.pop()
+                    self.captured_pieces[self.board.turn].pop() if captured_piece else None
+                    self.update_pieces()
+                else:
+                    self.root.after(500, self.play_bot)
         except Exception as e:
             logging.error(f"Move processing failed: {e}")
             messagebox.showerror("Error", f"Move processing failed: {e}")
@@ -483,7 +751,7 @@ class ChessApp:
             if self.board.is_game_over() or self.puzzle_mode:
                 return
             if self.board.turn == chess.BLACK:
-                move = get_bot_move(self.board, self.difficulty)
+                move = get_bot_move(self.board, self.difficulty, self.learning_data)
                 if move:
                     self.handle_move(move)
                 else:
@@ -495,6 +763,7 @@ class ChessApp:
 
     def new_game(self):
         try:
+            self.stop_timer()
             self.board.reset()
             self.move_history = []
             self.captured_pieces = {chess.WHITE: [], chess.BLACK: []}
@@ -508,6 +777,10 @@ class ChessApp:
             self.current_puzzle = None
             self.selected_square = None
             self.possible_moves = []
+            if not self.multiplayer_mode:
+                self.is_host = False
+                self.player_color = chess.WHITE
+                self.board_flipped = False
             self.canvas.delete("all")
             self.draw_board()
             self.update_pieces()
@@ -519,7 +792,7 @@ class ChessApp:
 
     def undo_move(self):
         try:
-            if self.move_history and not self.puzzle_mode:
+            if self.move_history and not self.puzzle_mode and not self.multiplayer_mode:
                 self.board.pop()
                 self.move_history.pop()
                 self.evaluations.pop() if self.evaluations else None
@@ -537,8 +810,8 @@ class ChessApp:
 
     def get_hint(self):
         try:
-            if not self.board.is_game_over() and not self.puzzle_mode:
-                move = get_bot_move(self.board, self.difficulty)
+            if not self.board.is_game_over() and not self.puzzle_mode and not self.multiplayer_mode:
+                move = get_bot_move(self.board, self.difficulty, self.learning_data)
                 if move:
                     san = self.board.san(move)
                     messagebox.showinfo("Hint", f"Suggested move: {san}")
@@ -555,6 +828,7 @@ class ChessApp:
             if not self.board.is_game_over() and not self.puzzle_mode:
                 winner = "Black" if self.board.turn == chess.WHITE else "White"
                 messagebox.showinfo("Resign", f"{winner} wins by resignation!")
+                self.cleanup_multiplayer()
                 self.new_game()
                 logging.info(f"Game resigned: {winner} wins")
         except Exception as e:
@@ -566,6 +840,7 @@ class ChessApp:
             if not self.board.is_game_over() and not self.puzzle_mode:
                 if messagebox.askyesno("Draw", "Offer a draw?"):
                     messagebox.showinfo("Draw", "Game ends in a draw!")
+                    self.cleanup_multiplayer()
                     self.new_game()
                     logging.info("Game ended in a draw")
         except Exception as e:
@@ -577,7 +852,7 @@ class ChessApp:
             game = chess.pgn.Game()
             game.headers["Event"] = "Chess Game"
             game.headers["White"] = "Player"
-            game.headers["Black"] = "AI"
+            game.headers["Black"] = "AI" if not self.multiplayer_mode else "Opponent"
             game.headers["Date"] = datetime.datetime.now().strftime("%Y.%m.%d")
             node = game
             for move in self.move_history:
@@ -613,8 +888,8 @@ class ChessApp:
                             self.captured_pieces[temp_board.turn].append(captured.piece_type)
                         san = temp_board.san(move)
                         temp_board.push(move)
-                        after_eval = evaluate(temp_board)
-                        self.evaluations.append(evaluate(temp_board) - after_eval if temp_board.turn == chess.BLACK else after_eval - evaluate(temp_board))
+                        after_eval = evaluate(temp_board, self.learning_data)
+                        self.evaluations.append(evaluate(temp_board, self.learning_data) - after_eval if temp_board.turn == chess.BLACK else after_eval - evaluate(temp_board, self.learning_data))
                         self.board.push(move)
                         self.move_history.append(move)
                         node = node.variations[0]
@@ -639,7 +914,7 @@ class ChessApp:
 
     def start_puzzle(self):
         try:
-            if not self.board.is_game_over() and not self.puzzle_mode:
+            if not self.board.is_game_over() and not self.puzzle_mode and not self.multiplayer_mode:
                 self.current_puzzle = random.choice(PUZZLES)
                 self.board.set_fen(self.current_puzzle["fen"])
                 self.puzzle_mode = True
@@ -662,8 +937,8 @@ class ChessApp:
     def analyze_game(self):
         try:
             if self.board.is_game_over() or self.puzzle_mode:
-                messagebox.showinfo("Analysis", f"Final Evaluation: {evaluate(self.board)/100:+.1f}")
-                logging.info(f"Game analyzed: {evaluate(self.board)/100:+.1f}")
+                messagebox.showinfo("Analysis", f"Final Evaluation: {evaluate(self.board, self.learning_data)/100:+.1f}")
+                logging.info(f"Game analyzed: {evaluate(self.board, self.learning_data)/100:+.1f}")
             else:
                 messagebox.showwarning("Analysis", "Finish the game first!")
         except Exception as e:
@@ -675,7 +950,6 @@ class ChessApp:
             if not self.move_history or self.puzzle_mode:
                 return
 
-            # Calculate accuracy
             total_moves = len(self.player_moves)
             accurate_moves = 0
             blunders = []
@@ -685,28 +959,27 @@ class ChessApp:
                     accurate_moves += 1
                 else:
                     temp_board.push(player_move)
-                    player_score = evaluate(temp_board)
+                    player_score = evaluate(temp_board, self.learning_data)
                     temp_board.pop()
                     temp_board.push(best_move)
-                    best_score = evaluate(temp_board)
+                    best_score = evaluate(temp_board, self.learning_data)
                     temp_board.pop()
                     eval_diff = abs(player_score - best_score) / 100.0
-                    if eval_diff > 3:  # Blunder threshold: 3 pawns
+                    if eval_diff > 3:
                         blunders.append((i + 1, temp_board.san(player_move), temp_board.san(best_move), eval_diff))
                 temp_board.push(player_move)
 
             accuracy = (accurate_moves / total_moves * 100) if total_moves > 0 else 0
-
-            # Calculate Elo
             result = {"1-0": 1, "0-1": 0, "1/2-1/2": 0.5}.get(self.board.result(), 0)
-            elo = 800 + (accuracy * 10) + (result * 200) + (self.difficulty * 50)
-            elo = min(max(int(elo), 800), 2800)  # Cap Elo between 800 and 2800
+            expected_score = 1 / (1 + 10 ** ((self.learning_data["elo"] - 1500) / 400))
+            performance = result - expected_score
+            self.learning_data["elo"] = min(max(self.learning_data["elo"] + 20 * performance, 800), 2800)
+            self.adjust_learning_weights(result)
 
-            # Generate analysis
             analysis = []
             analysis.append(f"Game Analysis - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             analysis.append(f"Result: {self.board.result()}")
-            analysis.append(f"Estimated Elo: {elo}")
+            analysis.append(f"Estimated Elo: {int(self.learning_data['elo'])}")
             analysis.append(f"Accuracy: {accuracy:.1f}%")
             analysis.append(f"Accurate Moves: {accurate_moves}/{total_moves}")
             if blunders:
@@ -716,7 +989,6 @@ class ChessApp:
             else:
                 analysis.append("\nNo major blunders! Well played.")
 
-            # Suggestions for improvement
             analysis.append("\nSuggestions for Improvement:")
             if accuracy < 60:
                 analysis.append("- Focus on finding the best moves by evaluating positions carefully.")
@@ -726,14 +998,13 @@ class ChessApp:
                 analysis.append("- Manage your time better to avoid time pressure mistakes.")
             analysis.append("- Practice tactical puzzles to improve your calculation skills.")
 
-            # Write to lvl.txt
             with open("lvl.txt", "a") as f:
                 f.write("\n".join(analysis) + "\n\n")
 
-            # Show summary to the user
-            summary = f"Game Over!\nEstimated Elo: {elo}\nAccuracy: {accuracy:.1f}%\nCheck lvl.txt for details."
+            summary = f"Game Over!\nEstimated Elo: {int(self.learning_data['elo'])}\nAccuracy: {accuracy:.1f}%\nCheck lvl.txt for details."
             messagebox.showinfo("Game Analysis", summary)
-            logging.info(f"Game analysis written to lvl.txt | Elo: {elo} | Accuracy: {accuracy:.1f}%")
+            logging.info(f"Game analysis written to lvl.txt | Elo: {int(self.learning_data['elo'])} | Accuracy: {accuracy:.1f}%")
+            self.save_learning_data()
         except Exception as e:
             logging.error(f"End game analysis failed: {e}")
             messagebox.showerror("Error", f"End game analysis failed: {e}")
@@ -744,7 +1015,6 @@ class ChessApp:
                 messagebox.showwarning("Analysis", "No moves to analyze or puzzle mode active!")
                 return
 
-            # Detailed statistics
             total_moves = len(self.player_moves)
             accurate_moves = 0
             blunders = []
@@ -755,15 +1025,15 @@ class ChessApp:
                     accurate_moves += 1
                 else:
                     temp_board.push(player_move)
-                    player_score = evaluate(temp_board)
+                    player_score = evaluate(temp_board, self.learning_data)
                     temp_board.pop()
                     temp_board.push(best_move)
-                    best_score = evaluate(temp_board)
+                    best_score = evaluate(temp_board, self.learning_data)
                     temp_board.pop()
                     eval_diff = abs(player_score - best_score) / 100.0
-                    if eval_diff > 3:  # Blunder threshold
+                    if eval_diff > 3:
                         blunders.append((i + 1, temp_board.san(player_move), temp_board.san(best_move), eval_diff))
-                    if eval_diff > 1:  # Missed opportunity threshold
+                    if eval_diff > 1:
                         missed_opportunities.append((i + 1, temp_board.san(player_move), temp_board.san(best_move), eval_diff))
                 temp_board.push(player_move)
 
@@ -772,7 +1042,6 @@ class ChessApp:
             elo = 800 + (accuracy * 10) + (result * 200) + (self.difficulty * 50)
             elo = min(max(int(elo), 800), 2800)
 
-            # Display detailed analysis
             analysis = []
             analysis.append(f"Detailed Game Analysis - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             analysis.append(f"Result: {self.board.result()}")
@@ -792,10 +1061,10 @@ class ChessApp:
             for i, move in enumerate(self.move_history):
                 san = temp_board.san(move)
                 temp_board.push(move)
-                eval_score = evaluate(temp_board) / 100.0
+                eval_score = evaluate(temp_board, self.learning_data) / 100.0
                 analysis.append(f"Move {i+1}: {san} (Eval: {eval_score:+.1f})")
 
-            self.last_deep_analysis = analysis  # Store for saving
+            self.last_deep_analysis = analysis
             messagebox.showinfo("Deep Analysis", "\n".join(analysis[:10]) + "\n\nFull details available to save in analysis.txt")
             logging.info("Deep analysis performed")
         except Exception as e:
@@ -854,11 +1123,53 @@ class ChessApp:
         try:
             self.difficulty = int(self.difficulty_var.get())
             logging.info(f"Difficulty changed to {self.difficulty}")
-        except Exception as e:
-            logging.error(f"Difficulty change failed: {e}")
+        except ValueError:
             self.difficulty = 3
             messagebox.showwarning("Warning", "Invalid difficulty, defaulting to 3")
             logging.warning("Invalid difficulty, defaulting to 3")
+        except Exception as e:
+            logging.error(f"Difficulty change failed: {e}")
+            self.difficulty = 3
+            messagebox.showerror("Error", f"Difficulty change failed: {e}")
+
+    def load_learning_data(self):
+        try:
+            if os.path.exists("learning_data.json"):
+                with open("learning_data.json", "r") as f:
+                    content = f.read().strip()
+                    if content:
+                        self.learning_data = json.loads(content)
+                    else:
+                        logging.warning("learning_data.json is empty, using default.")
+                        self.save_learning_data()
+            else:
+                logging.info("learning_data.json not found, creating default.")
+                self.save_learning_data()
+        except json.JSONDecodeError as e:
+            logging.error(f"Error decoding learning_data.json: {e}")
+            self.save_learning_data()
+        except Exception as e:
+            logging.error(f"Load learning data failed: {e}")
+            self.save_learning_data()
+
+    def save_learning_data(self):
+        try:
+            with open("learning_data.json", "w") as f:
+                json.dump(self.learning_data, f, indent=4)
+        except Exception as e:
+            logging.error(f"Save learning data failed: {e}")
+
+    def adjust_learning_weights(self, result):
+        try:
+            expected = 1 / (1 + 10 ** ((self.learning_data["elo"] - 1500) / 400))
+            error = result - expected
+            for key in self.learning_data["weights"]:
+                self.learning_data["weights"][key] += 0.01 * error
+                self.learning_data["weights"][key] = max(0.1, min(2.0, self.learning_data["weights"][key]))
+            self.learning_data["performance"] = (self.learning_data["performance"] * (self.learning_data["games"] - 1) + result) / self.learning_data["games"]
+            self.learning_data["games"] += 1
+        except Exception as e:
+            logging.error(f"Adjust learning weights failed: {e}")
 
 # --- MAIN ---
 if __name__ == "__main__":
